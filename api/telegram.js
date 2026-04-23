@@ -48,32 +48,37 @@ export default async function handler(req, res) {
     let response = await chatLibre(text, historial);
 
     // Loop de tool use - Claude puede querer llamar varias tools
-    let iteraciones = 0;
-    while (response.stop_reason === 'tool_use' && iteraciones < 5) {
-      iteraciones++;
-      const toolUses = response.content.filter((b) => b.type === 'tool_use');
-      const toolResults = [];
+  let mensajesConTools = [
+    ...historial,
+    { role: 'user', content: text },
+  ];
 
-      for (const tu of toolUses) {
-        const resultado = await ejecutarTool(tu.name, tu.input);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          content: resultado,
-        });
-      }
+  let iteraciones = 0;
+  while (response.stop_reason === 'tool_use' && iteraciones < 5) {
+    iteraciones++;
+    const toolUses = response.content.filter((b) => b.type === 'tool_use');
+    const toolResults = [];
 
-      // Segunda llamada a Claude con los resultados de las tools
-      const mensajesActualizados = [
-        ...historial,
-        { role: 'user', content: text },
-        { role: 'assistant', content: response.content },
-        { role: 'user', content: toolResults },
-      ];
-
-      response = await chatLibre('', mensajesActualizados.slice(0, -1), '');
+    for (const tu of toolUses) {
+      const resultado = await ejecutarTool(tu.name, tu.input);
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: tu.id,
+        content: resultado,
+      });
     }
 
+    // Agregamos el turno del asistente y los resultados al historial
+    mensajesConTools = [
+      ...mensajesConTools,
+      { role: 'assistant', content: response.content },
+      { role: 'user', content: toolResults },
+    ];
+
+    // Nueva llamada a Claude con el historial completo
+    const { chatLibreConMensajes } = await import('../lib/claude.js');
+    response = await chatLibreConMensajes(mensajesConTools);
+  }
     // Extraer respuesta final en texto
     const respuestaTexto = response.content
       .filter((b) => b.type === 'text')
