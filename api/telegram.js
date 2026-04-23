@@ -3,7 +3,10 @@ import { chatLibre } from '../lib/claude.js';
 import { sendMessage, isAuthorizedUser } from '../lib/telegram.js';
 import { listEvents, createEvent, formatEventsForPrompt } from '../lib/calendar.js';
 
-const redis = Redis.fromEnv();
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 const MAX_HISTORIAL = 10; // últimos 10 turnos
 
 /**
