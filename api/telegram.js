@@ -7,18 +7,14 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
-const MAX_HISTORIAL = 10; // últimos 10 turnos
 
-/**
- * Webhook de Telegram. Recibe mensajes, los procesa con Claude (con tool use
- * para crear/listar eventos), y responde.
- */
+const MAX_HISTORIAL = 10;
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Seguridad: Telegram nos manda un secret token en el header
   const telegramSecret = req.headers['x-telegram-bot-api-secret-token'];
   if (telegramSecret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -34,7 +30,6 @@ export default async function handler(req, res) {
   const chatId = message.chat.id;
   const text = message.text;
 
-  // Solo responde al usuario autorizado
   if (!isAuthorizedUser(userId)) {
     return res.status(200).json({ ok: true });
   }
@@ -42,103 +37,65 @@ export default async function handler(req, res) {
   try {
     // Recuperar historial de Redis
     const historialKey = `jarvis:historial:${userId}`;
-    const historial = (await redis.get(historialKey)) || [];
-
-    // Llamar a Claude con tool use
-    let response = await chatLibre(text, historial);
-
-    // Loop de tool use - Claude puede querer llamar varias tools
-  let mensajesConTools = [
-    ...historial,
-    { role: 'user', content: text },
-  ];
-
-  let iteraciones = 0;
-  while (response.stop_reason === 'tool_use' && iteraciones < 5) {
-    iteraciones++;
-    const toolUses = response.content.filter((b) => b.type === 'tool_use');
-    const toolResults = [];
-
-    for (const tu of toolUses) {
-      const resultado = await ejecutarTool(tu.name, tu.input);
-      toolResults.push({
-        type: 'tool_result',
-        tool_use_id: tu.id,
-        content: resultado,
-      });
+    let historial = [];
+    try {
+      historial = (await redis.get(historialKey)) || [];
+    } catch (_) {
+      historial = [];
     }
 
-    // Agregamos el turno del asistente y los resultados al historial
-    mensajesConTools = [
-      ...mensajesConTools,
-      { role: 'assistant', content: response.content },
-      { role: 'user', content: toolResults },
-    ];
+    // Ejecutor de tools - se lo pasamos a claude.js
+    const ejecutorTools = async (nombre, input) => {
+      const calendarId = process.env.GOOGLE_CALENDAR_ID;
 
-    // Nueva llamada a Claude con el historial completo
-    const { chatLibreConMensajes } = await import('../lib/claude.js');
-    response = await chatLibreConMensajes(mensajesConTools);
-  }
-    // Extraer respuesta final en texto
-    const respuestaTexto = response.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n') || 'Listo.';
+      if (nombre === 'crear_evento') {
+        const duracion = input.duracion_minutos || 30;
+        const inicio = new Date(input.fecha_hora_inicio);
+        const fin = new Date(inicio.getTime() + duracion * 60 * 1000);
+        const evento = await createEvent({
+          calendarId,
+          summary: input.titulo,
+          description: input.descripcion || '',
+          start: inicio.toISOString(),
+          end: fin.toISOString(),
+        });
+        return `Evento creado: "${evento.summary}" el ${inicio.toLocaleString('es-AR', { timeZone: 'America/Argentina/Mendoza' })}.`;
+      }
 
-    // Guardar historial actualizado (solo texto, no tool uses)
-    const nuevoHistorial = [
-      ...historial,
-      { role: 'user', content: text },
-      { role: 'assistant', content: respuestaTexto },
-    ].slice(-MAX_HISTORIAL * 2);
+      if (nombre === 'listar_eventos_hoy') {
+        const now = new Date();
+        const fin = new Date(now);
+        fin.setHours(23, 59, 59, 999);
+        const eventos = await listEvents({ calendarId, timeMin: now, timeMax: fin });
+        return formatEventsForPrompt(eventos);
+      }
 
-    await redis.set(historialKey, nuevoHistorial, { ex: 60 * 60 * 24 * 7 });
+      if (nombre === 'listar_eventos_rango') {
+        const eventos = await listEvents({
+          calendarId,
+          timeMin: new Date(input.desde),
+          timeMax: new Date(input.hasta),
+        });
+        return formatEventsForPrompt(eventos);
+      }
 
-    await sendMessage(chatId, respuestaTexto);
+      return `Tool "${nombre}" no reconocida.`;
+    };
+
+    // Llamar a Claude con tool use integrado
+    const { texto, mensajesFinales } = await chatLibre(text, historial, ejecutorTools);
+
+    // Guardar historial actualizado (solo los últimos MAX_HISTORIAL turnos)
+    const nuevoHistorial = mensajesFinales.slice(-(MAX_HISTORIAL * 2));
+    try {
+      await redis.set(historialKey, nuevoHistorial, { ex: 60 * 60 * 24 * 7 });
+    } catch (_) {}
+
+    await sendMessage(chatId, texto);
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error('Error en telegram handler:', error);
     await sendMessage(chatId, `Ups, algo falló: ${error.message}`);
     return res.status(200).json({ ok: true });
   }
-}
-
-/**
- * Ejecuta una tool que Claude pidió.
- */
-async function ejecutarTool(nombre, input) {
-  const calendarId = process.env.GOOGLE_CALENDAR_ID;
-
-  if (nombre === 'crear_evento') {
-    const duracion = input.duracion_minutos || 30;
-    const inicio = new Date(input.fecha_hora_inicio);
-    const fin = new Date(inicio.getTime() + duracion * 60 * 1000);
-    const evento = await createEvent({
-      calendarId,
-      summary: input.titulo,
-      description: input.descripcion || '',
-      start: inicio.toISOString(),
-      end: fin.toISOString(),
-    });
-    return `Evento creado: "${evento.summary}" el ${inicio.toLocaleString('es-AR', { timeZone: 'America/Argentina/Mendoza' })}.`;
-  }
-
-  if (nombre === 'listar_eventos_hoy') {
-    const now = new Date();
-    const fin = new Date(now);
-    fin.setHours(23, 59, 59, 999);
-    const eventos = await listEvents({ calendarId, timeMin: now, timeMax: fin });
-    return formatEventsForPrompt(eventos);
-  }
-
-  if (nombre === 'listar_eventos_rango') {
-    const eventos = await listEvents({
-      calendarId,
-      timeMin: new Date(input.desde),
-      timeMax: new Date(input.hasta),
-    });
-    return formatEventsForPrompt(eventos);
-  }
-
-  return `Tool "${nombre}" no reconocida.`;
 }
