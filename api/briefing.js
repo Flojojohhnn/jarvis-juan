@@ -1,55 +1,41 @@
 // api/briefing.js
-// Endpoint disparado por cron. Sincroniza calendar, calcula prioridades, arma briefing y lo manda por Telegram.
+'use strict';
 
-import { listarEventosRango } from '../lib/calendar.js';
-import {
-  sincronizarLeadsConCalendar,
-  listarLeadsPrioritarios,
-} from '../lib/leads.js';
-import { generarBriefing } from '../lib/claude.js';
-import { enviarMensaje } from '../lib/telegram.js';
+const { listarEventosRango } = require('../lib/calendar.js');
+const { sincronizarLeadsConCalendar, listarLeadsPrioritarios } = require('../lib/leads.js');
+const { generarBriefing } = require('../lib/claude.js');
+const { enviarMensaje } = require('../lib/telegram.js');
 
-export default async function handler(req, res) {
-  // Auth: Vercel Cron manda Authorization: Bearer <CRON_SECRET>
+module.exports = async function handler(req, res) {
   const auth = req.headers.authorization;
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: 'No autorizado' });
   }
 
   try {
-    // 1. Rango: últimos 7 días + próximos 7 días
     const ahora = new Date();
     const desde = new Date(ahora.getTime() - 7 * 24 * 60 * 60 * 1000);
     const hasta = new Date(ahora.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-    // 2. Traer eventos del calendar
     const eventos = await listarEventosRango(desde.toISOString(), hasta.toISOString());
-
-    // 3. Sincronizar leads existentes con lo que diga el calendar
     const resumenSync = await sincronizarLeadsConCalendar(eventos);
-
-    // 4. Listar leads prioritarios (ya actualizados)
     const leadsPrioritarios = await listarLeadsPrioritarios(10);
 
-    // 5. Próximos eventos de hoy (para mostrar agenda del día en briefing)
     const hoyISO = ahora.toISOString().slice(0, 10);
     const eventosHoy = eventos
       .filter((e) => {
         const inicio = e.start?.dateTime || e.start?.date;
         return inicio && inicio.slice(0, 10) === hoyISO;
       })
-      .map((e) => ({
-        titulo: e.summary,
-        inicio: e.start?.dateTime || e.start?.date,
-      }));
+      .map((e) => ({ titulo: e.summary, inicio: e.start?.dateTime || e.start?.date }));
 
-    // 6. Determinar qué tipo de briefing es según la hora AR
-    const horaAR = new Date(ahora.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' })).getHours();
+    const horaAR = new Date(
+      ahora.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' })
+    ).getHours();
     let tipoBriefing = 'matutino';
     if (horaAR >= 12 && horaAR < 17) tipoBriefing = 'mediodia';
     else if (horaAR >= 17) tipoBriefing = 'cierre';
 
-    // 7. Armar payload para Claude
     const payload = {
       tipo: tipoBriefing,
       fecha: hoyISO,
@@ -71,12 +57,9 @@ export default async function handler(req, res) {
       leads_en_calendar_sin_procesar: resumenSync.sin_match,
     };
 
-    // 8. Generar texto del briefing
     const textoBriefing = await generarBriefing(payload);
 
-    // 9. Armar mensaje final con la sección "sin procesar" si aplica
     let mensajeFinal = textoBriefing;
-
     if (resumenSync.sin_match.length > 0) {
       mensajeFinal += '\n\n📋 *Leads en calendar sin cargar en Jarvis:*';
       resumenSync.sin_match.forEach((l) => {
@@ -85,7 +68,6 @@ export default async function handler(req, res) {
       mensajeFinal += '\n\n_Buscalos en Tecnom, procesalos con el Asistente de Ventas y cargalos al bot._';
     }
 
-    // 10. Enviar por Telegram
     await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, mensajeFinal);
 
     return res.status(200).json({
@@ -93,16 +75,12 @@ export default async function handler(req, res) {
       tipo: tipoBriefing,
       leads_actualizados: resumenSync.actualizados.length,
       leads_sin_match: resumenSync.sin_match.length,
-      eventos_sin_parsear: resumenSync.sin_parsear,
     });
   } catch (err) {
     console.error('Error en briefing:', err);
     try {
-      await enviarMensaje(
-        process.env.TELEGRAM_ALLOWED_USER_ID,
-        `⚠️ Error generando briefing: ${err.message}`
-      );
+      await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error generando briefing: ${err.message}`);
     } catch {}
     return res.status(500).json({ error: err.message });
   }
-}
+};
