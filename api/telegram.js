@@ -15,8 +15,6 @@ const HISTORIAL_KEY = (userId) => `jarvis:historial:${userId}`;
 const HISTORIAL_TTL = 7 * 24 * 60 * 60;
 const MAX_TURNOS = 10;
 
-// Garantiza que el historial empiece con un mensaje user de texto puro
-// (previene tool_result huérfanos de sesiones rotas anteriores)
 function sanitizarHistorial(historial) {
   if (!Array.isArray(historial) || historial.length === 0) return [];
   for (let i = 0; i < historial.length; i++) {
@@ -29,6 +27,7 @@ function sanitizarHistorial(historial) {
 }
 
 async function ejecutorTools(toolName, input) {
+  console.log(`[TOOL] Ejecutando ${toolName}`);
   switch (toolName) {
     case 'crear_evento': {
       const evento = await crearEvento({ summary: input.titulo, description: input.descripcion || '', start: input.fecha_hora_inicio, duracionMinutos: input.duracion_minutos || 15 });
@@ -123,17 +122,19 @@ export default async function handler(req, res) {
     return res.status(401).send('no');
   }
 
-  res.status(200).json({ ok: true });
-
   try {
     const update = req.body;
     const mensaje = update.message;
-    if (!mensaje) return;
+    if (!mensaje) {
+      return res.status(200).json({ ok: true, skipped: 'no message' });
+    }
 
     const userId = String(mensaje.from.id);
+    console.log(`[WEBHOOK] Mensaje de ${userId}: ${mensaje.text?.slice(0, 50) || '(sin texto)'}`);
+
     if (userId !== String(process.env.TELEGRAM_ALLOWED_USER_ID)) {
       await enviarMensaje(userId, 'No autorizado.');
-      return;
+      return res.status(200).json({ ok: true, skipped: 'unauthorized' });
     }
 
     let texto = mensaje.text;
@@ -142,33 +143,43 @@ export default async function handler(req, res) {
     if (texto === '/reset') {
       await redis.del(HISTORIAL_KEY(userId));
       await enviarMensaje(userId, '✅ Historial borrado. Empezamos de cero.');
-      return;
+      return res.status(200).json({ ok: true });
     }
     if (texto === '/start') {
       await enviarMensaje(userId, 'Hola Juan. Soy Jarvis. Mandame texto o audio y arrancamos.\n\nComandos:\n/reset — borrar memoria de la conversación');
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     if (!texto && (mensaje.voice || mensaje.audio)) {
       const fileId = (mensaje.voice || mensaje.audio).file_id;
       const audioData = await descargarAudioTelegram(fileId);
-      if (!audioData) { await enviarMensaje(userId, 'No pude descargar el audio.'); return; }
+      if (!audioData) {
+        await enviarMensaje(userId, 'No pude descargar el audio.');
+        return res.status(200).json({ ok: true });
+      }
       texto = await transcribirAudio(audioData.base64, audioData.mediaType);
-      if (!texto) { await enviarMensaje(userId, 'No pude transcribir el audio.'); return; }
+      if (!texto) {
+        await enviarMensaje(userId, 'No pude transcribir el audio.');
+        return res.status(200).json({ ok: true });
+      }
       await enviarMensaje(userId, `🎙️ _"${texto.slice(0, 300)}${texto.length > 300 ? '...' : ''}"_`);
     }
 
-    if (!texto) { await enviarMensaje(userId, 'Mandame texto o audio.'); return; }
+    if (!texto) {
+      await enviarMensaje(userId, 'Mandame texto o audio.');
+      return res.status(200).json({ ok: true });
+    }
 
     const historialPrevioRaw = (await redis.get(HISTORIAL_KEY(userId))) || [];
     const historialPrevio = sanitizarHistorial(historialPrevioRaw);
     const mensajes = [...historialPrevio, { role: 'user', content: texto }];
 
+    console.log(`[CHAT] Llamando a Claude con ${mensajes.length} mensajes`);
+
     let respuesta;
     try {
       respuesta = await chatLibre(mensajes, ejecutorTools);
     } catch (err) {
-      // Recuperación automática: si falla por historial corrupto, limpiar y reintentar
       if (err.status === 400 && String(err.message || '').includes('tool_use')) {
         console.warn('Historial corrupto detectado, reseteando y reintentando');
         await redis.del(HISTORIAL_KEY(userId));
@@ -178,11 +189,20 @@ export default async function handler(req, res) {
       }
     }
 
+    console.log(`[CHAT] Respuesta lista: ${respuesta.slice(0, 100)}`);
+
     const historialNuevo = [...historialPrevio, { role: 'user', content: texto }, { role: 'assistant', content: respuesta }].slice(-MAX_TURNOS * 2);
     await redis.set(HISTORIAL_KEY(userId), historialNuevo, { ex: HISTORIAL_TTL });
+
     await enviarMensaje(userId, respuesta);
+    console.log(`[WEBHOOK] Mensaje enviado a ${userId}`);
+
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error('Error en telegram webhook:', err);
-    try { await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error: ${err.message}`); } catch {}
+    console.error('[ERROR] telegram webhook:', err.message, err.stack);
+    try {
+      await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error: ${err.message}`);
+    } catch {}
+    return res.status(500).json({ error: err.message });
   }
 }
