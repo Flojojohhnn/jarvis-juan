@@ -1,23 +1,14 @@
 // api/telegram.js
-// Webhook de Telegram. Recibe mensajes (texto o audio), los procesa con Claude + tools, y responde.
+'use strict';
 
-import { Redis } from '@upstash/redis';
-import { chatLibre, extraerCamposDeResumen, extraerCamposDeNota } from '../lib/claude.js';
-import {
-  crearEvento,
-  listarEventosHoy,
-  listarEventosRango,
-} from '../lib/calendar.js';
-import {
-  guardarLead,
-  obtenerLead,
-  buscarLeadPorNombre,
-  actualizarLead,
-  listarLeadsPrioritarios,
-  normalizarTelefono,
-  sincronizarLeadsConCalendar,
-} from '../lib/leads.js';
-import { enviarMensaje, transcribirAudioTelegram } from '../lib/telegram.js';
+const { Redis } = require('@upstash/redis');
+const { chatLibre, extraerCamposDeResumen, extraerCamposDeNota, transcribirAudio } = require('../lib/claude.js');
+const { crearEvento, listarEventosHoy, listarEventosRango } = require('../lib/calendar.js');
+const {
+  guardarLead, obtenerLead, buscarLeadPorNombre, actualizarLead,
+  listarLeadsPrioritarios, normalizarTelefono, sincronizarLeadsConCalendar,
+} = require('../lib/leads.js');
+const { enviarMensaje, descargarAudioTelegram } = require('../lib/telegram.js');
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -25,7 +16,7 @@ const redis = new Redis({
 });
 
 const HISTORIAL_KEY = (userId) => `jarvis:historial:${userId}`;
-const HISTORIAL_TTL = 7 * 24 * 60 * 60; // 7 días
+const HISTORIAL_TTL = 7 * 24 * 60 * 60;
 const MAX_TURNOS = 10;
 
 // ============================================================
@@ -47,23 +38,17 @@ async function ejecutorTools(toolName, input) {
     case 'listar_eventos_hoy': {
       const eventos = await listarEventosHoy();
       if (!eventos.length) return 'No hay eventos programados para hoy.';
-      return eventos
-        .map((e) => `• ${e.start?.dateTime || e.start?.date}: ${e.summary}`)
-        .join('\n');
+      return eventos.map((e) => `• ${e.start?.dateTime || e.start?.date}: ${e.summary}`).join('\n');
     }
 
     case 'listar_eventos_rango': {
       const eventos = await listarEventosRango(input.desde, input.hasta);
       if (!eventos.length) return 'No hay eventos en ese rango.';
-      return eventos
-        .map((e) => `• ${e.start?.dateTime || e.start?.date}: ${e.summary}`)
-        .join('\n');
+      return eventos.map((e) => `• ${e.start?.dateTime || e.start?.date}: ${e.summary}`).join('\n');
     }
 
     case 'guardar_lead': {
-      // Extraer campos estructurados del resumen
       const extraidos = await extraerCamposDeResumen(input.resumen_asistente);
-
       const lead = await guardarLead({
         nombre: input.nombre,
         telefono: input.telefono,
@@ -77,12 +62,11 @@ async function ejecutorTools(toolName, input) {
         competencia: extraidos.competencia,
         objecion_principal: extraidos.objecion_principal,
         proxima_accion: extraidos.proxima_accion_sugerida,
-        proxima_accion_fecha: null, // se llena cuando Tecnom vuelque el evento
+        proxima_accion_fecha: null,
         ultima_gestion_fecha: null,
         ultima_gestion_tipo: null,
         ultima_gestion_detalle: null,
       });
-
       return (
         `Lead guardado: ${lead.nombre} (${lead.telefono})\n` +
         `• Probabilidad: ${lead.probabilidad_cierre}\n` +
@@ -92,45 +76,29 @@ async function ejecutorTools(toolName, input) {
         `• Competencia: ${lead.competencia}\n` +
         `• Objeción: ${lead.objecion_principal || '—'}\n` +
         `• Próxima acción sugerida: ${lead.proxima_accion || '—'}\n\n` +
-        `Corregí cualquiera de estos valores diciéndomelo.`
+        `Corregí cualquier campo diciéndome.`
       );
     }
 
     case 'actualizar_lead_manual': {
-      // Buscar lead por teléfono o nombre
       let lead = null;
       const posibleTel = normalizarTelefono(input.nombre_o_telefono);
-      if (posibleTel && posibleTel.length >= 8) {
-        lead = await obtenerLead(posibleTel);
-      }
-      if (!lead) {
-        lead = await buscarLeadPorNombre(input.nombre_o_telefono);
-      }
+      if (posibleTel && posibleTel.length >= 8) lead = await obtenerLead(posibleTel);
+      if (!lead) lead = await buscarLeadPorNombre(input.nombre_o_telefono);
       if (!lead) return `No encontré lead con "${input.nombre_o_telefono}".`;
 
-      // Extraer pistas adicionales de la nota
       const extraidos = await extraerCamposDeNota(input.nota);
-
       const cambios = {};
-      if (input.nueva_probabilidad !== undefined && input.nueva_probabilidad !== null) {
-        cambios.probabilidad_cierre = input.nueva_probabilidad;
-      } else if (extraidos.nueva_probabilidad !== null) {
-        cambios.probabilidad_cierre = extraidos.nueva_probabilidad;
-      }
+      if (input.nueva_probabilidad != null) cambios.probabilidad_cierre = input.nueva_probabilidad;
+      else if (extraidos.nueva_probabilidad != null) cambios.probabilidad_cierre = extraidos.nueva_probabilidad;
 
-      if (input.nueva_objecion) {
-        cambios.objecion_principal = input.nueva_objecion;
-      } else if (extraidos.nueva_objecion) {
-        cambios.objecion_principal = extraidos.nueva_objecion;
-      }
+      if (input.nueva_objecion) cambios.objecion_principal = input.nueva_objecion;
+      else if (extraidos.nueva_objecion) cambios.objecion_principal = extraidos.nueva_objecion;
 
       const actualizado = await actualizarLead(
-        lead.telefono,
-        cambios,
-        'audio',
+        lead.telefono, cambios, 'audio',
         extraidos.resumen_corto || input.nota.slice(0, 200)
       );
-
       return (
         `Lead actualizado: ${actualizado.nombre}\n` +
         (cambios.probabilidad_cierre ? `• Nueva probabilidad: ${cambios.probabilidad_cierre}\n` : '') +
@@ -142,25 +110,18 @@ async function ejecutorTools(toolName, input) {
     case 'listar_leads_prioritarios': {
       const leads = await listarLeadsPrioritarios(input.limite || 10);
       if (!leads.length) return 'No hay leads cargados todavía.';
-      return leads
-        .map(
-          (l, i) =>
-            `${i + 1}. ${l.nombre} — score ${l.score} (prob ${l.probabilidad_cierre} + urg ${l.urgencia_puntos})\n` +
-            `   ${l.urgencia_razon || 'sin urgencia especial'}\n` +
-            `   Próxima: ${l.proxima_accion || '—'}${l.proxima_accion_fecha ? ` el ${l.proxima_accion_fecha.slice(0, 16).replace('T', ' ')}` : ''}`
-        )
-        .join('\n\n');
+      return leads.map((l, i) =>
+        `${i + 1}. ${l.nombre} — score ${l.score} (prob ${l.probabilidad_cierre} + urg ${l.urgencia_puntos})\n` +
+        `   ${l.urgencia_razon || 'sin urgencia especial'}\n` +
+        `   Próxima: ${l.proxima_accion || '—'}${l.proxima_accion_fecha ? ` el ${l.proxima_accion_fecha.slice(0, 16).replace('T', ' ')}` : ''}`
+      ).join('\n\n');
     }
 
     case 'ver_lead': {
       let lead = null;
       const posibleTel = normalizarTelefono(input.nombre_o_telefono);
-      if (posibleTel && posibleTel.length >= 8) {
-        lead = await obtenerLead(posibleTel);
-      }
-      if (!lead) {
-        lead = await buscarLeadPorNombre(input.nombre_o_telefono);
-      }
+      if (posibleTel && posibleTel.length >= 8) lead = await obtenerLead(posibleTel);
+      if (!lead) lead = await buscarLeadPorNombre(input.nombre_o_telefono);
       if (!lead) return `No encontré lead con "${input.nombre_o_telefono}".`;
       return JSON.stringify(lead, null, 2);
     }
@@ -173,12 +134,10 @@ async function ejecutorTools(toolName, input) {
       const resumen = await sincronizarLeadsConCalendar(eventos);
       return (
         `Sincronización completa.\n` +
-        `• Leads actualizados: ${resumen.actualizados.length} (${resumen.actualizados.join(', ') || '—'})\n` +
-        `• Eventos de clientes no cargados en Jarvis: ${resumen.sin_match.length}\n` +
-        (resumen.sin_match.length
-          ? resumen.sin_match.map((l) => `  → ${l.nombre} ${l.telefono}`).join('\n') + '\n'
-          : '') +
-        `• Eventos no parseables (ignorados): ${resumen.sin_parsear}`
+        `• Actualizados: ${resumen.actualizados.length} (${resumen.actualizados.join(', ') || '—'})\n` +
+        `• Sin cargar en Jarvis: ${resumen.sin_match.length}\n` +
+        (resumen.sin_match.length ? resumen.sin_match.map((l) => `  → ${l.nombre} ${l.telefono}`).join('\n') + '\n' : '') +
+        `• No parseables (ignorados): ${resumen.sin_parsear}`
       );
     }
 
@@ -188,17 +147,15 @@ async function ejecutorTools(toolName, input) {
 }
 
 // ============================================================
-// Handler principal
+// Handler
 // ============================================================
 
-export default async function handler(req, res) {
-  // Verificar secret del webhook
+module.exports = async function handler(req, res) {
   const secret = req.headers['x-telegram-bot-api-secret-token'];
   if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
     return res.status(401).send('no');
   }
 
-  // Responder rápido a Telegram para evitar retries
   res.status(200).json({ ok: true });
 
   try {
@@ -212,18 +169,21 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Obtener texto (puede venir de .text o de un audio transcripto)
     let texto = mensaje.text;
 
     if (!texto && (mensaje.voice || mensaje.audio)) {
       const fileId = (mensaje.voice || mensaje.audio).file_id;
-      texto = await transcribirAudioTelegram(fileId);
+      const audioData = await descargarAudioTelegram(fileId);
+      if (!audioData) {
+        await enviarMensaje(userId, 'No pude descargar el audio. Intentá de nuevo.');
+        return;
+      }
+      texto = await transcribirAudio(audioData.base64, audioData.mediaType);
       if (!texto) {
         await enviarMensaje(userId, 'No pude transcribir el audio. Intentá de nuevo.');
         return;
       }
-      // Avisar que se recibió y se transcribió
-      await enviarMensaje(userId, `🎙️ Transcripción: "${texto.slice(0, 300)}${texto.length > 300 ? '...' : ''}"`);
+      await enviarMensaje(userId, `🎙️ _"${texto.slice(0, 300)}${texto.length > 300 ? '...' : ''}"_`);
     }
 
     if (!texto) {
@@ -231,16 +191,10 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Cargar historial
     const historialPrevio = (await redis.get(HISTORIAL_KEY(userId))) || [];
-
-    // Armar mensajes para Claude
     const mensajes = [...historialPrevio, { role: 'user', content: texto }];
-
-    // Chat con loop de tools
     const respuesta = await chatLibre(mensajes, ejecutorTools);
 
-    // Guardar historial actualizado (solo últimos MAX_TURNOS turnos user+assistant)
     const historialNuevo = [
       ...historialPrevio,
       { role: 'user', content: texto },
@@ -248,16 +202,11 @@ export default async function handler(req, res) {
     ].slice(-MAX_TURNOS * 2);
 
     await redis.set(HISTORIAL_KEY(userId), historialNuevo, { ex: HISTORIAL_TTL });
-
-    // Responder
     await enviarMensaje(userId, respuesta);
   } catch (err) {
     console.error('Error en telegram webhook:', err);
     try {
-      await enviarMensaje(
-        process.env.TELEGRAM_ALLOWED_USER_ID,
-        `⚠️ Error procesando tu mensaje: ${err.message}`
-      );
+      await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error: ${err.message}`);
     } catch {}
   }
-}
+};
