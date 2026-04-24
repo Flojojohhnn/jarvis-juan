@@ -15,6 +15,19 @@ const HISTORIAL_KEY = (userId) => `jarvis:historial:${userId}`;
 const HISTORIAL_TTL = 7 * 24 * 60 * 60;
 const MAX_TURNOS = 10;
 
+// Garantiza que el historial empiece con un mensaje user de texto puro
+// (previene tool_result huérfanos de sesiones rotas anteriores)
+function sanitizarHistorial(historial) {
+  if (!Array.isArray(historial) || historial.length === 0) return [];
+  for (let i = 0; i < historial.length; i++) {
+    const msg = historial[i];
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      return historial.slice(i);
+    }
+  }
+  return [];
+}
+
 async function ejecutorTools(toolName, input) {
   switch (toolName) {
     case 'crear_evento': {
@@ -125,6 +138,17 @@ export default async function handler(req, res) {
 
     let texto = mensaje.text;
 
+    // Comandos slash
+    if (texto === '/reset') {
+      await redis.del(HISTORIAL_KEY(userId));
+      await enviarMensaje(userId, '✅ Historial borrado. Empezamos de cero.');
+      return;
+    }
+    if (texto === '/start') {
+      await enviarMensaje(userId, 'Hola Juan. Soy Jarvis. Mandame texto o audio y arrancamos.\n\nComandos:\n/reset — borrar memoria de la conversación');
+      return;
+    }
+
     if (!texto && (mensaje.voice || mensaje.audio)) {
       const fileId = (mensaje.voice || mensaje.audio).file_id;
       const audioData = await descargarAudioTelegram(fileId);
@@ -136,9 +160,23 @@ export default async function handler(req, res) {
 
     if (!texto) { await enviarMensaje(userId, 'Mandame texto o audio.'); return; }
 
-    const historialPrevio = (await redis.get(HISTORIAL_KEY(userId))) || [];
+    const historialPrevioRaw = (await redis.get(HISTORIAL_KEY(userId))) || [];
+    const historialPrevio = sanitizarHistorial(historialPrevioRaw);
     const mensajes = [...historialPrevio, { role: 'user', content: texto }];
-    const respuesta = await chatLibre(mensajes, ejecutorTools);
+
+    let respuesta;
+    try {
+      respuesta = await chatLibre(mensajes, ejecutorTools);
+    } catch (err) {
+      // Recuperación automática: si falla por historial corrupto, limpiar y reintentar
+      if (err.status === 400 && String(err.message || '').includes('tool_use')) {
+        console.warn('Historial corrupto detectado, reseteando y reintentando');
+        await redis.del(HISTORIAL_KEY(userId));
+        respuesta = await chatLibre([{ role: 'user', content: texto }], ejecutorTools);
+      } else {
+        throw err;
+      }
+    }
 
     const historialNuevo = [...historialPrevio, { role: 'user', content: texto }, { role: 'assistant', content: respuesta }].slice(-MAX_TURNOS * 2);
     await redis.set(HISTORIAL_KEY(userId), historialNuevo, { ex: HISTORIAL_TTL });
