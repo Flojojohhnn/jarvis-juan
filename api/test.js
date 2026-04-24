@@ -1,40 +1,78 @@
-import { listEvents, formatEventsForPrompt } from '../lib/calendar.js';
-import { briefingMatutino } from '../lib/claude.js';
-import { sendMessage } from '../lib/telegram.js';
+import { listarEventosRango } from '../lib/calendar.js';
+import { sincronizarLeadsConCalendar, listarLeadsPrioritarios } from '../lib/leads.js';
+import { generarBriefing } from '../lib/claude.js';
+import { enviarMensaje } from '../lib/telegram.js';
 
-/**
- * Endpoint de prueba manual. Llamalo desde el browser pasando ?key=TU_CRON_SECRET
- * para verificar que todo funciona antes de esperar a que corra el cron.
- *
- * Ejemplo: https://tu-app.vercel.app/api/test?key=xxxxx
- */
+// Endpoint manual para testear el briefing sin esperar el cron.
+// Llamar con: GET /api/test?key=TU_CRON_SECRET
 export default async function handler(req, res) {
   if (req.query.key !== process.env.CRON_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ error: 'No autorizado' });
   }
 
-  const chatId = process.env.TELEGRAM_ALLOWED_USER_ID;
-  const calendarId = process.env.GOOGLE_CALENDAR_ID;
-
   try {
-    const now = new Date();
-    const fin = new Date(now);
-    fin.setHours(23, 59, 59, 999);
+    const ahora = new Date();
+    const desde = new Date(ahora.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const hasta = new Date(ahora.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-    const eventos = await listEvents({ calendarId, timeMin: now, timeMax: fin });
-    const resumen = formatEventsForPrompt(eventos);
-    const texto = await briefingMatutino(resumen);
+    const eventos = await listarEventosRango(desde.toISOString(), hasta.toISOString());
+    const resumenSync = await sincronizarLeadsConCalendar(eventos);
+    const leadsPrioritarios = await listarLeadsPrioritarios(10);
 
-    await sendMessage(chatId, `[TEST] ${texto}`);
+    const arDate = new Date(ahora.getTime() - 3 * 60 * 60 * 1000);
+    const hoyISO = arDate.toISOString().slice(0, 10);
+    const eventosHoy = eventos
+      .filter((e) => (e.start?.dateTime || e.start?.date || '').slice(0, 10) === hoyISO)
+      .map((e) => ({ titulo: e.summary, inicio: e.start?.dateTime || e.start?.date }));
+
+    const horaAR = arDate.getUTCHours();
+    const tipoBriefing = horaAR < 12 ? 'matutino' : horaAR < 17 ? 'mediodia' : 'cierre';
+
+    const payload = {
+      tipo: tipoBriefing,
+      fecha: hoyISO,
+      leads_prioritarios: leadsPrioritarios.map((l) => ({
+        nombre: l.nombre,
+        telefono: l.telefono,
+        modelo: l.modelo_interes,
+        probabilidad_cierre: l.probabilidad_cierre,
+        urgencia_puntos: l.urgencia_puntos,
+        urgencia_razon: l.urgencia_razon,
+        score_total: l.score,
+        proxima_accion: l.proxima_accion,
+        proxima_accion_fecha: l.proxima_accion_fecha,
+        ultima_gestion_detalle: l.ultima_gestion_detalle,
+        objecion_principal: l.objecion_principal,
+        etapa: l.etapa,
+      })),
+      eventos_hoy: eventosHoy,
+      leads_en_calendar_sin_procesar: resumenSync.sin_match,
+    };
+
+    const textoBriefing = await generarBriefing(payload);
+
+    let mensajeFinal = `[TEST] ${textoBriefing}`;
+    if (resumenSync.sin_match.length > 0) {
+      mensajeFinal += '\n\n📋 *Leads en calendar sin cargar en Jarvis:*';
+      resumenSync.sin_match.forEach((l) => {
+        mensajeFinal += `\n• ${l.nombre} — ${l.telefono}`;
+      });
+      mensajeFinal += '\n\n_Procesalos con el Asistente de Ventas y cargalos al bot._';
+    }
+
+    await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, mensajeFinal);
 
     return res.status(200).json({
       ok: true,
+      tipo: tipoBriefing,
       eventos_encontrados: eventos.length,
-      resumen,
-      respuesta_claude: texto,
+      eventos_hoy: eventosHoy.length,
+      leads_actualizados: resumenSync.actualizados.length,
+      leads_sin_match: resumenSync.sin_match.length,
+      leads_prioritarios: leadsPrioritarios.length,
     });
-  } catch (error) {
-    console.error('Error:', error);
-    return res.status(500).json({ error: error.message, stack: error.stack });
+  } catch (err) {
+    console.error('[ERROR] test:', err.message, err.stack);
+    return res.status(500).json({ error: err.message, stack: err.stack });
   }
 }

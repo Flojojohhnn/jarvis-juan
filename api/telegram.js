@@ -1,5 +1,3 @@
-// api/telegram.js
-
 import { Redis } from '@upstash/redis';
 import { chatLibre, extraerCamposDeResumen, extraerCamposDeNota, transcribirAudio } from '../lib/claude.js';
 import { crearEvento, listarEventosHoy, listarEventosRango } from '../lib/calendar.js';
@@ -13,10 +11,12 @@ const redis = new Redis({
 
 const HISTORIAL_KEY = (userId) => `jarvis:historial:${userId}`;
 const HISTORIAL_TTL = 7 * 24 * 60 * 60;
-const MAX_TURNOS = 10;
+const MAX_MENSAJES = 20;
 
 function sanitizarHistorial(historial) {
   if (!Array.isArray(historial) || historial.length === 0) return [];
+  // Filtrar para que empiece con un user message de texto puro
+  // Evita tool_result huérfanos de sesiones rotas
   for (let i = 0; i < historial.length; i++) {
     const msg = historial[i];
     if (msg.role === 'user' && typeof msg.content === 'string') {
@@ -30,7 +30,12 @@ async function ejecutorTools(toolName, input) {
   console.log(`[TOOL] Ejecutando ${toolName}`);
   switch (toolName) {
     case 'crear_evento': {
-      const evento = await crearEvento({ summary: input.titulo, description: input.descripcion || '', start: input.fecha_hora_inicio, duracionMinutos: input.duracion_minutos || 15 });
+      const evento = await crearEvento({
+        summary: input.titulo,
+        description: input.descripcion || '',
+        start: input.fecha_hora_inicio,
+        duracionMinutos: input.duracion_minutos || 15,
+      });
       return `Evento creado: "${evento.summary}" el ${evento.start?.dateTime}`;
     }
     case 'listar_eventos_hoy': {
@@ -46,18 +51,27 @@ async function ejecutorTools(toolName, input) {
     case 'guardar_lead': {
       const extraidos = await extraerCamposDeResumen(input.resumen_asistente);
       const lead = await guardarLead({
-        nombre: input.nombre, telefono: input.telefono, email: input.email || null,
-        modelo_interes: input.modelo_interes || null, resumen_asistente: input.resumen_asistente,
-        probabilidad_cierre: extraidos.probabilidad_cierre, etapa: extraidos.etapa,
-        plan_discutido: extraidos.plan_discutido, usado_parte_pago: extraidos.usado_parte_pago,
-        competencia: extraidos.competencia, objecion_principal: extraidos.objecion_principal,
-        proxima_accion: extraidos.proxima_accion_sugerida, proxima_accion_fecha: null,
-        ultima_gestion_fecha: null, ultima_gestion_tipo: null, ultima_gestion_detalle: null,
+        nombre: input.nombre,
+        telefono: input.telefono,
+        email: input.email || null,
+        modelo_interes: input.modelo_interes || null,
+        resumen_asistente: input.resumen_asistente,
+        probabilidad_cierre: extraidos.probabilidad_cierre,
+        etapa: extraidos.etapa,
+        plan_discutido: extraidos.plan_discutido,
+        usado_parte_pago: extraidos.usado_parte_pago,
+        competencia: extraidos.competencia,
+        objecion_principal: extraidos.objecion_principal,
+        proxima_accion: extraidos.proxima_accion_sugerida,
+        proxima_accion_fecha: null,
+        ultima_gestion_fecha: null,
+        ultima_gestion_tipo: null,
+        ultima_gestion_detalle: null,
       });
       return (
         `Lead guardado: ${lead.nombre} (${lead.telefono})\n` +
         `• Probabilidad: ${lead.probabilidad_cierre}\n• Etapa: ${lead.etapa}\n` +
-        `• Plan: ${lead.plan_discutido || '—'}\n• Usado: ${lead.usado_parte_pago}\n` +
+        `• Plan: ${lead.plan_discutido || '—'}\n• Parte de pago: ${lead.usado_parte_pago}\n` +
         `• Competencia: ${lead.competencia}\n• Objeción: ${lead.objecion_principal || '—'}\n` +
         `• Próxima acción: ${lead.proxima_accion || '—'}\n\nCorregí cualquier campo diciéndome.`
       );
@@ -76,11 +90,15 @@ async function ejecutorTools(toolName, input) {
       if (input.nueva_objecion) cambios.objecion_principal = input.nueva_objecion;
       else if (extraidos.nueva_objecion) cambios.objecion_principal = extraidos.nueva_objecion;
 
-      const actualizado = await actualizarLead(lead.telefono, cambios, 'audio', extraidos.resumen_corto || input.nota.slice(0, 200));
-      return `Lead actualizado: ${actualizado.nombre}\n` +
-        (cambios.probabilidad_cierre ? `• Nueva probabilidad: ${cambios.probabilidad_cierre}\n` : '') +
+      const actualizado = await actualizarLead(
+        lead.telefono, cambios, 'manual', extraidos.resumen_corto || input.nota.slice(0, 200)
+      );
+      return (
+        `Lead actualizado: ${actualizado.nombre}\n` +
+        (cambios.probabilidad_cierre != null ? `• Nueva probabilidad: ${cambios.probabilidad_cierre}\n` : '') +
         (cambios.objecion_principal ? `• Objeción: ${cambios.objecion_principal}\n` : '') +
-        `• Nota registrada.`;
+        `• Nota registrada.`
+      );
     }
     case 'listar_leads_prioritarios': {
       const leads = await listarLeadsPrioritarios(input.limite || 10);
@@ -105,11 +123,13 @@ async function ejecutorTools(toolName, input) {
       const hasta = new Date(ahora.getTime() + 7 * 24 * 60 * 60 * 1000);
       const eventos = await listarEventosRango(desde.toISOString(), hasta.toISOString());
       const resumen = await sincronizarLeadsConCalendar(eventos);
-      return `Sincronización completa.\n` +
+      return (
+        `Sincronización completa.\n` +
         `• Actualizados: ${resumen.actualizados.length} (${resumen.actualizados.join(', ') || '—'})\n` +
         `• Sin cargar en Jarvis: ${resumen.sin_match.length}\n` +
         (resumen.sin_match.length ? resumen.sin_match.map((l) => `  → ${l.nombre} ${l.telefono}`).join('\n') + '\n' : '') +
-        `• No parseables: ${resumen.sin_parsear}`;
+        `• No parseables: ${resumen.sin_parsear}`
+      );
     }
     default:
       return `Tool desconocida: ${toolName}`;
@@ -117,92 +137,102 @@ async function ejecutorTools(toolName, input) {
 }
 
 export default async function handler(req, res) {
+  // 1. Verificar secret antes de cualquier otra cosa
   const secret = req.headers['x-telegram-bot-api-secret-token'];
   if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
     return res.status(401).send('no');
   }
 
-  try {
-    const update = req.body;
-    const mensaje = update.message;
-    if (!mensaje) {
-      return res.status(200).json({ ok: true, skipped: 'no message' });
-    }
+  // 2. Responder 200 a Telegram INMEDIATAMENTE para evitar reintentos
+  res.status(200).json({ ok: true });
 
-    const userId = String(mensaje.from.id);
-    console.log(`[WEBHOOK] Mensaje de ${userId}: ${mensaje.text?.slice(0, 50) || '(sin texto)'}`);
-
-    if (userId !== String(process.env.TELEGRAM_ALLOWED_USER_ID)) {
-      await enviarMensaje(userId, 'No autorizado.');
-      return res.status(200).json({ ok: true, skipped: 'unauthorized' });
-    }
-
-    let texto = mensaje.text;
-
-    // Comandos slash
-    if (texto === '/reset') {
-      await redis.del(HISTORIAL_KEY(userId));
-      await enviarMensaje(userId, '✅ Historial borrado. Empezamos de cero.');
-      return res.status(200).json({ ok: true });
-    }
-    if (texto === '/start') {
-      await enviarMensaje(userId, 'Hola Juan. Soy Jarvis. Mandame texto o audio y arrancamos.\n\nComandos:\n/reset — borrar memoria de la conversación');
-      return res.status(200).json({ ok: true });
-    }
-
-    if (!texto && (mensaje.voice || mensaje.audio)) {
-      const fileId = (mensaje.voice || mensaje.audio).file_id;
-      const audioData = await descargarAudioTelegram(fileId);
-      if (!audioData) {
-        await enviarMensaje(userId, 'No pude descargar el audio.');
-        return res.status(200).json({ ok: true });
-      }
-      texto = await transcribirAudio(audioData.base64, audioData.mediaType);
-      if (!texto) {
-        await enviarMensaje(userId, 'No pude transcribir el audio.');
-        return res.status(200).json({ ok: true });
-      }
-      await enviarMensaje(userId, `🎙️ _"${texto.slice(0, 300)}${texto.length > 300 ? '...' : ''}"_`);
-    }
-
-    if (!texto) {
-      await enviarMensaje(userId, 'Mandame texto o audio.');
-      return res.status(200).json({ ok: true });
-    }
-
-    const historialPrevioRaw = (await redis.get(HISTORIAL_KEY(userId))) || [];
-    const historialPrevio = sanitizarHistorial(historialPrevioRaw);
-    const mensajes = [...historialPrevio, { role: 'user', content: texto }];
-
-    console.log(`[CHAT] Llamando a Claude con ${mensajes.length} mensajes`);
-
-    let respuesta;
+  // 3. Procesamiento asíncrono sin bloquear la respuesta
+  (async () => {
     try {
-      respuesta = await chatLibre(mensajes, ejecutorTools);
-    } catch (err) {
-      if (err.status === 400 && String(err.message || '').includes('tool_use')) {
-        console.warn('Historial corrupto detectado, reseteando y reintentando');
+      const update = req.body;
+      const mensaje = update?.message;
+      if (!mensaje) return;
+
+      const userId = String(mensaje.from.id);
+      console.log(`[WEBHOOK] Mensaje de ${userId}: ${mensaje.text?.slice(0, 50) || '(sin texto)'}`);
+
+      if (userId !== String(process.env.TELEGRAM_ALLOWED_USER_ID)) {
+        await enviarMensaje(userId, 'No autorizado.');
+        return;
+      }
+
+      // Comandos slash
+      if (mensaje.text === '/reset') {
         await redis.del(HISTORIAL_KEY(userId));
-        respuesta = await chatLibre([{ role: 'user', content: texto }], ejecutorTools);
-      } else {
-        throw err;
+        await enviarMensaje(userId, '✅ Historial borrado. Empezamos de cero.');
+        return;
       }
+      if (mensaje.text === '/start') {
+        await enviarMensaje(userId, 'Hola Juan. Soy Jarvis, tu asistente de ventas.\n\nMandame texto o audio y arrancamos.\n\n/reset — borrar memoria de la conversación');
+        return;
+      }
+
+      let texto = mensaje.text || null;
+
+      // Audio / mensajes de voz
+      if (!texto && (mensaje.voice || mensaje.audio)) {
+        const fileId = (mensaje.voice || mensaje.audio).file_id;
+        const audioData = await descargarAudioTelegram(fileId);
+        if (!audioData) {
+          await enviarMensaje(userId, 'No pude descargar el audio.');
+          return;
+        }
+        texto = await transcribirAudio(audioData.base64, audioData.mediaType);
+        if (!texto) {
+          await enviarMensaje(userId, 'No pude transcribir el audio.');
+          return;
+        }
+        await enviarMensaje(userId, `🎙️ _"${texto.slice(0, 300)}${texto.length > 300 ? '...' : ''}"_`);
+      }
+
+      if (!texto) {
+        await enviarMensaje(userId, 'Mandame texto o audio.');
+        return;
+      }
+
+      // Cargar y sanitizar historial
+      const historialRaw = (await redis.get(HISTORIAL_KEY(userId))) || [];
+      const historialPrevio = sanitizarHistorial(historialRaw);
+      const mensajes = [...historialPrevio, { role: 'user', content: texto }];
+
+      console.log(`[CHAT] Llamando a Claude con ${mensajes.length} mensajes en historial`);
+
+      let respuesta;
+      try {
+        respuesta = await chatLibre(mensajes, ejecutorTools);
+      } catch (err) {
+        // Historial corrupto: limpiar y reintentar con solo el mensaje actual
+        if (err.status === 400 && String(err.message || '').includes('tool_use')) {
+          console.warn('[CHAT] Historial corrupto detectado, reseteando y reintentando');
+          await redis.del(HISTORIAL_KEY(userId));
+          respuesta = await chatLibre([{ role: 'user', content: texto }], ejecutorTools);
+        } else {
+          throw err;
+        }
+      }
+
+      console.log(`[CHAT] Respuesta lista: ${respuesta.slice(0, 100)}`);
+
+      // Guardar historial actualizado (solo pares user/assistant en texto plano)
+      const historialNuevo = [
+        ...historialPrevio,
+        { role: 'user', content: texto },
+        { role: 'assistant', content: respuesta },
+      ].slice(-MAX_MENSAJES);
+      await redis.set(HISTORIAL_KEY(userId), historialNuevo, { ex: HISTORIAL_TTL });
+
+      await enviarMensaje(userId, respuesta);
+      console.log(`[WEBHOOK] Mensaje enviado a ${userId}`);
+    } catch (err) {
+      console.error('[ERROR] telegram webhook:', err.message, err.stack);
+      try {
+        await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error: ${err.message}`);
+      } catch {}
     }
-
-    console.log(`[CHAT] Respuesta lista: ${respuesta.slice(0, 100)}`);
-
-    const historialNuevo = [...historialPrevio, { role: 'user', content: texto }, { role: 'assistant', content: respuesta }].slice(-MAX_TURNOS * 2);
-    await redis.set(HISTORIAL_KEY(userId), historialNuevo, { ex: HISTORIAL_TTL });
-
-    await enviarMensaje(userId, respuesta);
-    console.log(`[WEBHOOK] Mensaje enviado a ${userId}`);
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error('[ERROR] telegram webhook:', err.message, err.stack);
-    try {
-      await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error: ${err.message}`);
-    } catch {}
-    return res.status(500).json({ error: err.message });
-  }
+  })();
 }
