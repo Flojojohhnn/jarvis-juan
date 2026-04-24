@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "description": "Asistente personal de Juan - Telegram bot + briefings automáticos desde Google Calendar",
-  "type": "module",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
