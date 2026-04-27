@@ -61,6 +61,9 @@ export default async function handler(req, res) {
       });
       mensajeFinal += '\n\n_Procesalos con el Asistente de Ventas y cargalos al bot._';
     }
+    if (resumenSync.sin_parsear > 0) {
+      mensajeFinal += `\n\n_${resumenSync.sin_parsear} evento${resumenSync.sin_parsear > 1 ? 's' : ''} del calendar sin formato Tecnom (sin campo Celular) — no se procesaron._`;
+    }
 
     await enviarMensaje(process.env.TELEGRAM_ALLOWED_USER_ID, mensajeFinal);
 
